@@ -26,6 +26,16 @@ from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from ...activations import ACT2FN, get_activation
+from ...adapters.composition import adjust_tensors_for_parallel
+from ...adapters.context import ForwardContext
+from ...adapters.lora import Linear as LoRALinear
+from ...adapters.mixins.electra import (
+    ElectraModelAdaptersMixin,
+    ElectraOutputAdaptersMixin,
+    ElectraSelfOutputAdaptersMixin,
+)
+from ...adapters.model_mixin import ModelWithHeadsAdaptersMixin
+from ...adapters.prefix_tuning import PrefixTuningShim
 from ...modeling_outputs import (
     BaseModelOutputWithCrossAttentions,
     BaseModelOutputWithPastAndCrossAttentions,
@@ -217,7 +227,7 @@ class ElectraEmbeddings(nn.Module):
 
 # Copied from transformers.models.bert.modeling_bert.BertSelfAttention with Bert->Electra
 class ElectraSelfAttention(nn.Module):
-    def __init__(self, config, position_embedding_type=None):
+    def __init__(self, config, position_embedding_type=None, location_key: Optional[str] = None):
         super().__init__()
         if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
             raise ValueError(
@@ -229,9 +239,9 @@ class ElectraSelfAttention(nn.Module):
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
-        self.query = nn.Linear(config.hidden_size, self.all_head_size)
-        self.key = nn.Linear(config.hidden_size, self.all_head_size)
-        self.value = nn.Linear(config.hidden_size, self.all_head_size)
+        self.query = LoRALinear(config.hidden_size, self.all_head_size, "selfattn", config, attn_key="q")
+        self.key = LoRALinear(config.hidden_size, self.all_head_size, "selfattn", config, attn_key="k")
+        self.value = LoRALinear(config.hidden_size, self.all_head_size, "selfattn", config, attn_key="v")
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.position_embedding_type = position_embedding_type or getattr(
@@ -242,6 +252,8 @@ class ElectraSelfAttention(nn.Module):
             self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
 
         self.is_decoder = config.is_decoder
+
+        self.prefix_tuning = PrefixTuningShim(location_key + "_prefix" if location_key else None, config)
 
     def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
@@ -295,6 +307,11 @@ class ElectraSelfAttention(nn.Module):
             # if encoder bi-directional self-attention `past_key_value` is always `None`
             past_key_value = (key_layer, value_layer)
 
+        # TODO tohle mel v te puvodni electre
+        # key_layer, value_layer, attention_mask = self.prefix_tuning(key_layer, value_layer, attention_mask)
+        key_layer, value_layer, attention_mask = self.prefix_tuning(
+            key_layer, value_layer, hidden_states, attention_mask
+        )
         # Take the dot product between "query" and "key" to get the raw attention scores.
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
 
@@ -344,25 +361,30 @@ class ElectraSelfAttention(nn.Module):
 
 
 # Copied from transformers.models.bert.modeling_bert.BertSelfOutput
-class ElectraSelfOutput(nn.Module):
+class ElectraSelfOutput(ElectraSelfOutputAdaptersMixin, nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config = config
+
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self._init_adapter_modules()
 
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
+        hidden_states = self.adapter_layer_forward(hidden_states, input_tensor, self.LayerNorm)
         return hidden_states
 
 
 # Copied from transformers.models.bert.modeling_bert.BertAttention with Bert->Electra
 class ElectraAttention(nn.Module):
-    def __init__(self, config, position_embedding_type=None):
+    def __init__(self, config, position_embedding_type=None, location_key: Optional[str] = None):
         super().__init__()
-        self.self = ElectraSelfAttention(config, position_embedding_type=position_embedding_type)
+        self.self = ElectraSelfAttention(
+            config, position_embedding_type=position_embedding_type, location_key=location_key
+        )
         self.output = ElectraSelfOutput(config)
         self.pruned_heads = set()
 
@@ -412,7 +434,7 @@ class ElectraAttention(nn.Module):
 class ElectraIntermediate(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
+        self.dense = LoRALinear(config.hidden_size, config.intermediate_size, "intermediate", config)
         if isinstance(config.hidden_act, str):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
@@ -425,17 +447,20 @@ class ElectraIntermediate(nn.Module):
 
 
 # Copied from transformers.models.bert.modeling_bert.BertOutput
-class ElectraOutput(nn.Module):
+class ElectraOutput(ElectraOutputAdaptersMixin, nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
+        self.config = config
+
+        self.dense = LoRALinear(config.intermediate_size, config.hidden_size, "output", config)
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self._init_adapter_modules()
 
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
+        hidden_states = self.adapter_layer_forward(hidden_states, input_tensor, self.LayerNorm)
         return hidden_states
 
 
@@ -445,13 +470,13 @@ class ElectraLayer(nn.Module):
         super().__init__()
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
-        self.attention = ElectraAttention(config)
+        self.attention = ElectraAttention(config, location_key="self")
         self.is_decoder = config.is_decoder
         self.add_cross_attention = config.add_cross_attention
         if self.add_cross_attention:
             if not self.is_decoder:
                 raise ValueError(f"{self} should be used as a decoder model if cross attention is added")
-            self.crossattention = ElectraAttention(config, position_embedding_type="absolute")
+            self.crossattention = ElectraAttention(config, position_embedding_type="absolute", location_key="cross")
         self.intermediate = ElectraIntermediate(config)
         self.output = ElectraOutput(config)
 
@@ -487,8 +512,7 @@ class ElectraLayer(nn.Module):
         if self.is_decoder and encoder_hidden_states is not None:
             if not hasattr(self, "crossattention"):
                 raise ValueError(
-                    f"If `encoder_hidden_states` are passed, {self} has to be instantiated with cross-attention layers"
-                    " by setting `config.add_cross_attention=True`"
+                    f"If `encoder_hidden_states` are passed, {self} has to be instantiated with cross-attention layers by setting `config.add_cross_attention=True`"
                 )
 
             # cross_attn cached key/values tuple is at positions 3,4 of past_key_value tuple
@@ -593,6 +617,8 @@ class ElectraEncoder(nn.Module):
                 )
 
             hidden_states = layer_outputs[0]
+            (attention_mask,) = adjust_tensors_for_parallel(hidden_states, attention_mask)
+
             if use_cache:
                 next_decoder_cache += (layer_outputs[-1],)
             if output_attentions:
@@ -670,6 +696,8 @@ class ElectraPreTrainedModel(PreTrainedModel):
     base_model_prefix = "electra"
     supports_gradient_checkpointing = True
     _keys_to_ignore_on_load_missing = [r"position_ids"]
+    # TODO tady nevim jestli nema byt lomitko pred
+    # _keys_to_ignore_on_load_unexpected = [r"electra\.embeddings_project\.weight", r"electra\.embeddings_project\.bias"]
     _keys_to_ignore_on_load_unexpected = [r"electra.embeddings_project.weight", r"electra.embeddings_project.bias"]
 
     # Copied from transformers.models.bert.modeling_bert.BertPreTrainedModel._init_weights
@@ -807,7 +835,7 @@ ELECTRA_INPUTS_DOCSTRING = r"""
     "Both the generator and discriminator checkpoints may be loaded into this model.",
     ELECTRA_START_DOCSTRING,
 )
-class ElectraModel(ElectraPreTrainedModel):
+class ElectraModel(ElectraModelAdaptersMixin, ElectraPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.embeddings = ElectraEmbeddings(config)
@@ -817,6 +845,7 @@ class ElectraModel(ElectraPreTrainedModel):
 
         self.encoder = ElectraEncoder(config)
         self.config = config
+        self._init_adapter_modules()
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -841,6 +870,7 @@ class ElectraModel(ElectraPreTrainedModel):
         output_type=BaseModelOutputWithCrossAttentions,
         config_class=_CONFIG_FOR_DOC,
     )
+    @ForwardContext.wrap
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
@@ -910,6 +940,7 @@ class ElectraModel(ElectraPreTrainedModel):
             inputs_embeds=inputs_embeds,
             past_key_values_length=past_key_values_length,
         )
+        hidden_states = self.invertible_adapters_forward(hidden_states)
 
         if hasattr(self, "embeddings_project"):
             hidden_states = self.embeddings_project(hidden_states)
@@ -959,7 +990,7 @@ class ElectraClassificationHead(nn.Module):
     """,
     ELECTRA_START_DOCSTRING,
 )
-class ElectraForSequenceClassification(ElectraPreTrainedModel):
+class ElectraForSequenceClassification(ModelWithHeadsAdaptersMixin, ElectraPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
@@ -1058,7 +1089,7 @@ class ElectraForSequenceClassification(ElectraPreTrainedModel):
     """,
     ELECTRA_START_DOCSTRING,
 )
-class ElectraForPreTraining(ElectraPreTrainedModel):
+class ElectraForPreTraining(ModelWithHeadsAdaptersMixin, ElectraPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
 
@@ -1164,7 +1195,7 @@ class ElectraForPreTraining(ElectraPreTrainedModel):
     """,
     ELECTRA_START_DOCSTRING,
 )
-class ElectraForMaskedLM(ElectraPreTrainedModel):
+class ElectraForMaskedLM(ModelWithHeadsAdaptersMixin, ElectraPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
 
@@ -1226,6 +1257,7 @@ class ElectraForMaskedLM(ElectraPreTrainedModel):
         generator_sequence_output = generator_hidden_states[0]
 
         prediction_scores = self.generator_predictions(generator_sequence_output)
+        prediction_scores = self.electra.invertible_adapters_forward(prediction_scores, rev=True)
         prediction_scores = self.generator_lm_head(prediction_scores)
 
         loss = None
@@ -1254,7 +1286,7 @@ class ElectraForMaskedLM(ElectraPreTrainedModel):
     """,
     ELECTRA_START_DOCSTRING,
 )
-class ElectraForTokenClassification(ElectraPreTrainedModel):
+class ElectraForTokenClassification(ModelWithHeadsAdaptersMixin, ElectraPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
@@ -1336,7 +1368,7 @@ class ElectraForTokenClassification(ElectraPreTrainedModel):
     """,
     ELECTRA_START_DOCSTRING,
 )
-class ElectraForQuestionAnswering(ElectraPreTrainedModel):
+class ElectraForQuestionAnswering(ModelWithHeadsAdaptersMixin, ElectraPreTrainedModel):
     config_class = ElectraConfig
     base_model_prefix = "electra"
 
@@ -1445,7 +1477,7 @@ class ElectraForQuestionAnswering(ElectraPreTrainedModel):
     """,
     ELECTRA_START_DOCSTRING,
 )
-class ElectraForMultipleChoice(ElectraPreTrainedModel):
+class ElectraForMultipleChoice(ModelWithHeadsAdaptersMixin, ElectraPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
 
@@ -1533,7 +1565,7 @@ class ElectraForMultipleChoice(ElectraPreTrainedModel):
 @add_start_docstrings(
     """ELECTRA Model with a `language modeling` head on top for CLM fine-tuning.""", ELECTRA_START_DOCSTRING
 )
-class ElectraForCausalLM(ElectraPreTrainedModel):
+class ElectraForCausalLM(ModelWithHeadsAdaptersMixin, ElectraPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
 
@@ -1635,7 +1667,9 @@ class ElectraForCausalLM(ElectraPreTrainedModel):
         )
 
         sequence_output = outputs[0]
-        prediction_scores = self.generator_lm_head(self.generator_predictions(sequence_output))
+        prediction_scores = self.generator_lm_head(
+            self.electra.invertible_adapters_forward(self.generator_predictions(sequence_output), rev=True)
+        )
 
         lm_loss = None
         if labels is not None:

@@ -10,13 +10,7 @@ import torch
 from torch import nn
 
 from .composition import AdapterCompositionBlock, Fuse, Stack, parse_composition
-from .configuration import (
-    ADAPTER_CONFIG_MAP,
-    AdapterConfig,
-    AdapterConfigBase,
-    AdapterFusionConfig,
-    get_adapter_config_hash,
-)
+from .configuration import AdapterConfig, AdapterConfigBase, AdapterFusionConfig, get_adapter_config_hash
 from .context import AdapterSetup, ForwardContext
 from .hub_mixin import PushAdapterToHubMixin
 from .layer import AdapterLayer, AdapterLayerBase
@@ -163,17 +157,12 @@ class EmbeddingAdaptersMixin:
             else:
                 embedding_dim = self.config.hidden_size
         embedding = nn.Embedding(len(tokenizer), embedding_dim)
-        # Use same initialization as base Transformer model
-        embedding.weight.data.normal_(mean=0.0, std=0.02)
-        if embedding.padding_idx is not None:
-            embedding.weight.data[embedding.padding_idx].zero_()
         embedding.requires_grad_(False)
         if (reference_embedding is not None and reference_tokenizer is None) or (
             reference_tokenizer is not None and reference_embedding is None
         ):
             raise KeyError(
-                "Reference embedding and reference tokenizer are required to use initialize embeddings from reference"
-                " embedding"
+                "Reference embedding and reference tokenizer are required to use initialize embeddings from reference embedding"
             )
         if reference_embedding is not None and reference_tokenizer is not None:
             tokens = set(tokenizer.get_vocab().keys()) & set(reference_tokenizer.get_vocab().keys())
@@ -402,7 +391,7 @@ class ModelAdaptersMixin(PushAdapterToHubMixin, ABC):
                     )
 
         # Make sure LoRA is reset
-        self.reset_adapter()
+        self.reset_lora()
         self.config.adapters.active_setup = adapter_setup
         self.config.adapters.skip_layers = skip_layers
 
@@ -787,11 +776,6 @@ class ModelAdaptersMixin(PushAdapterToHubMixin, ABC):
         }
 
         context.prefix_states = self.base_model.prefix_tuning(*args, **kwargs)
-        # Adapter gating and attention outputs
-        context.output_adapter_gating_scores = kwargs.get("output_adapter_gating_scores", False)
-        context.output_adapter_fusion_attentions = kwargs.get("output_adapter_fusion_attentions", False)
-        context.adapter_gating_scores = defaultdict(dict)
-        context.adapter_fusion_attentions = defaultdict(dict)
 
     def get_fusion_regularization_loss(self):
         reg_loss = 0.0
@@ -861,12 +845,7 @@ class ModelAdaptersMixin(PushAdapterToHubMixin, ABC):
         rows = []
         # fill in data for adapters
         for name, config_name in self.config.adapters.adapters.items():
-            if config_name in self.config.adapters.config_map:
-                config = self.config.adapters.config_map.get(config_name, None)
-            else:
-                config = ADAPTER_CONFIG_MAP.get(config_name, None)
-            if isinstance(config, str):
-                config = ADAPTER_CONFIG_MAP[config]
+            config = self.config.adapters.config_map[config_name]
             row = {"name": name, "architecture": config.get("architecture", None) or "bottleneck"}
             weights = self.get_adapter(name)
             row["active"] = self.active_adapters is not None and name in self.active_adapters.flatten()
@@ -902,14 +881,12 @@ class ModelAdaptersMixin(PushAdapterToHubMixin, ABC):
             # print
             total_length = 80
             header_format = "{:<25}{:<15}{:>12}{:>12}{:>8}{:>8}"
-            row_format = "{:<25}{:<15}{:>12,}{:>12.3f}{:>8}{:>8}"
-            s = ["=" * total_length]
-            s.append(header_format.format(*map(lambda x: x.title(), header)))
+            row_format = "{:<25}{:<15}{:>12}{:>12.3f}{:>8}{:>8}"
+            s = [header_format.format(*map(lambda x: x.title(), header))]
             s.append("-" * total_length)
             for row in rows:
                 s.append(row_format.format(*[row.get(h, "") for h in header]))
             s.insert(len(s) - 1, "-" * total_length)
-            s.append("=" * total_length)
             return "\n".join(s)
 
     def eject_prefix_tuning(self, name: str):
@@ -924,7 +901,7 @@ class ModelAdaptersMixin(PushAdapterToHubMixin, ABC):
                 if name in module.prefix_tunings:
                     module.prefix_tunings[name].eject()
 
-    def merge_adapter(self, name: str):
+    def merge_lora(self, name: str):
         """
         Merges the weights of the given LoRA module with the Transformer weights as described in the paper.
 
@@ -934,15 +911,15 @@ class ModelAdaptersMixin(PushAdapterToHubMixin, ABC):
         for module in self.modules():
             if isinstance(module, LoRALayer):
                 if name in module.loras:
-                    module.merge_adapter(name)
+                    module.merge_lora(name)
 
-    def reset_adapter(self):
+    def reset_lora(self):
         """
-        Resets weights of a LoRA module merged using `model.merge_adapter(name)`.
+        Resets weights of a LoRA module merged using `model.merge_lora(name)`.
         """
         for module in self.modules():
             if isinstance(module, LoRALayer):
-                module.reset_adapter()
+                module.reset_lora()
 
 
 @inherit_doc

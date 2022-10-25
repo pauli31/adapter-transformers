@@ -127,6 +127,7 @@ _REGULAR_SUPPORTED_MODEL_NAMES_AND_TASKS = [
     "trocr",
     "vit",
     "xglm",
+    "electra"
     # "xlnet",
     # TODO: add support for them as it should be quite easy to do so (small blocking issues).
 ]

@@ -21,6 +21,36 @@ limitations under the License.
 <span>adapter-transformers</span>
 </h1>
 
+
+based on the original repo and 
+https://github.com/amitkumarj441/adapter-transformers/blob/epatch/src/transformers/adapters/mixins/electra.py
+
+Electra integration for Adapters
+
+Enviorment setup
+
+1. Create dir for project and create virtual env in it
+~~~
+mkdir transformers
+python -m venv ./transformers/adapters-env
+~~~
+
+2.a) Activate virtual env on Windows, on Linux it is done a little differently
+~~~
+source adapters-env/Scripts/activate
+~~~
+
+2.a) Activate virtual env on Linux
+~~~
+source adapters-env/bin/activate 
+~~~
+
+
+A. Deactivation
+~~~
+deactivate
+~~~
+
 <h3 align="center">
 A friendly fork of HuggingFace's <i>Transformers</i>, adding Adapters to PyTorch language models
 </h3>
